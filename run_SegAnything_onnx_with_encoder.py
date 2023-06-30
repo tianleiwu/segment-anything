@@ -16,16 +16,14 @@ MODEL_TYPE = "vit_b"
 # MODEL_LIST = [sam_vit_b_01ec64  sam_vit_l_0b3195 sam_vit_h_4b8939]
 TORCH_MODEL_PATH = f"model_weights/sam_vit_b_01ec64.pth"
 
-ENCODER_ONNX_MODEL_PATH = f"model_weights/withEncoder/{MODEL_TYPE}/encoder.onnx"
+USE_OPT_ONNX = False
+ENCODER_ONNX_MODEL_PATH = f"model_weights/withEncoder/{MODEL_TYPE}/" + ("encoder_opt.onnx" if USE_OPT_ONNX else "encoder.onnx")
 
 USE_SINGLEMASK = False
 if USE_SINGLEMASK:
-    DECODER_ONNX_MODEL_PATH = f"model_weights/sam_{MODEL_TYPE}_singlemask.onnx"
-    
+    DECODER_ONNX_MODEL_PATH = f"model_weights/sam_{MODEL_TYPE}_singlemask.onnx"    
 else:
-    # DECODER_ONNX_MODEL_PATH = f"model_weights/sam_{MODEL_TYPE}.onnx"
-    DECODER_ONNX_MODEL_PATH = f"model_weights/withEncoder/{MODEL_TYPE}/decoder.onnx"
-    
+    DECODER_ONNX_MODEL_PATH = f"model_weights/withEncoder/{MODEL_TYPE}/" + ("decoder_opt.onnx" if USE_OPT_ONNX else "decoder.onnx")
     
 USE_QUANTIZED = False
 if USE_QUANTIZED:
@@ -34,7 +32,7 @@ if USE_QUANTIZED:
     ENCODER_ONNX_MODEL_PATH = ENCODER_ONNX_MODEL_QUANTIZED_PATH
     DECODER_ONNX_MODEL_PATH = DECODER_ONNX_MODEL_QUANTIZED_PATH
     
-DEVICE = "cpu"
+DEVICE = "cuda"
 SHOW = False
 time_total = 0.0
 
@@ -104,8 +102,12 @@ class SAMOnnxRunner():
             f"model_type should be set"
     
         # Init Onnx InferenceSession
-        self.encoder_session = ort.InferenceSession(self.encoder_path)
-        self.decoder_session = ort.InferenceSession(self.decoder_path)
+        if device == "cpu":
+            providers = ['CPUExecutionProvider']
+        else:
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self.encoder_session = ort.InferenceSession(self.encoder_path, providers=providers)
+        self.decoder_session = ort.InferenceSession(self.decoder_path, providers=providers)
             
     # --------------------------------- #
     def _preprocess_image(self , srcImage):
@@ -121,8 +123,8 @@ class SAMOnnxRunner():
             input_img = self.transform.apply_image(image)
             input_img_torch = torch.as_tensor(input_img , device=self.device)
             input_img_torch = input_img_torch.permute(2,0,1).contiguous()[None , : , : ,:]
-            pixel_mean = torch.Tensor([123.675,116.28,103.53]).view(-1,1,1)
-            pixel_std = torch.Tensor([58.395,57.12,57.375]).view(-1,1,1)
+            pixel_mean = torch.Tensor([123.675,116.28,103.53]).to(self.device).view(-1,1,1)
+            pixel_std = torch.Tensor([58.395,57.12,57.375]).to(self.device).view(-1,1,1)
             x = (input_img_torch - pixel_mean) / pixel_std
             h , w = x.shape[-2:]
             padh = encoder_input_size - h
@@ -130,9 +132,9 @@ class SAMOnnxRunner():
             # F.pad (左边填充数， 右边填充数， 上边填充数， 下边填充数)
             # 前两个参数对最后一个维度有效，后两个参数对倒数第二维有效
             x = F.pad(x , (0 , padw , 0 , padh)) 
-            x = x.numpy()
-            
-        except:
+            x = x.cpu().numpy()
+        except Exception as e:
+            print(e)
             raise Exception
         
         encoder_inputs = {
@@ -196,9 +198,6 @@ class SAMOnnxRunner():
         return encoder_output
            
     def _inference_decoder(self , ort_inputs):
-       
-        ort_inputs["image_embeddings"] = self.image_embedding
-        
         time_start = time.time()
         # Predict a mask and threshold it.
         masks , iou_predictions , low_res_logits = self.decoder_session.run(None, ort_inputs)
@@ -225,25 +224,38 @@ class SAMOnnxRunner():
         image = self._preprocess_image(srcImage)
         
         if not self.init_encoder:
+            time_start = time.time()
             encoder_inputs = self._preprocess_encoder(image)
+            time_end = time.time()
+            time_cost = time_end - time_start
+            print(f"preprocess encoder time : {time_cost}" , "s")
+
+            # warm up decoder
+            encoder_outputs = self.encoder_session.run(None , encoder_inputs)
+
             encoder_outputs = self._inference_encoder(encoder_inputs)
             self.image_embedding = encoder_outputs[0]
             self.init_encoder = True
-        
+
+        time_start = time.time()
         img , ort_inputs= self._preprocess_decoder(image , point , label , box)
+        time_end = time.time()
+        time_cost = time_end - time_start
+        print(f"preprocess decoder time : {time_cost}" , "s")
+
+        ort_inputs["image_embeddings"] = self.image_embedding
+
+        # warm up decoder
+        self.decoder_session.run(None, ort_inputs)
+
         masks , iou_predictions , low_res_logits = self._inference_decoder(ort_inputs)
         self._postprocess()
         return masks , iou_predictions , low_res_logits
         
         
 def main():
-    image_dir = r"E:\OroChiLab\Data\NailsJpgfile\images\test"
-    if USE_SINGLEMASK:
-        save_dir = r"data//result//singlemask"
-    else:
-        save_dir = r"data//result//multimask"
-    
-    save_dir = r"data//result//encoder_test"
+    image_dir = r"test_images"
+    save_dir = "test_results"
     
     # Get Input Information
     input_point = np.array([[1156, 550]])
